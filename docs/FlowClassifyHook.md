@@ -15,6 +15,7 @@
     - [Hook Integration and Flow](#hook-integration-and-flow)
     - [Stream Hook Lifecycle](#stream-hook-lifecycle)
 6. [WFP Implementation Details](#wfp-implementation-details)
+7. [Datagram Extension](#datagram-extension)
 
 
 ---
@@ -25,6 +26,9 @@ Support an eBPF interface to support inspecting TCP stream data and then based o
 
 The new hooks will support security and observability related solutions that require parsing TCP stream data
 without incurring overhead for flows that can be ignored.
+
+The [Datagram Extension](#datagram-extension) reuses the same program type with a separate attach
+type for flow classification at `FWPM_LAYER_DATAGRAM_DATA_V4/V6`.
 
 ## Requirements
 
@@ -42,6 +46,7 @@ without incurring overhead for flows that can be ignored.
   - If the flow is blocked, no further stream-layer eBPF programs will be invoked for the flow.
   - If the flow is allowed, other stream layer programs that are still classifying the flow will continue to be invoked.
 - We do not currently need any stream mutation support for these hooks -- only inline inspect/allow/block.
+- Datagram-specific requirements are defined in the [Datagram Extension](#datagram-extension).
 
 ## Alternative - Using existing Linux hooks
 
@@ -75,6 +80,8 @@ The proposed stream inspection extension introduces a new eBPF program type for 
 
 _Note:_ Using a single program type for all 3 hooks enables tail calls between programs attached to the 3 hooks
 to simplify flow classification designs.
+
+The datagram extension reuses this program type.
 
 ```c
 /**
@@ -304,3 +311,132 @@ WFP resource management:
 - **Context Cleanup**: Flow contexts are immediately freed by the extension when the flow is allowed/blocked.
   For flows that terminate while still being classified, the extension will free them after invoking the program(s) in the flow deleted callout.
 - **Memory Management**: Temporary buffers for non-contiguous data are allocated from non-paged pool and freed immediately after program execution.
+
+## Datagram Extension
+
+The datagram extension adds `EBPF_ATTACH_TYPE_DATAGRAM_FLOW_CLASSIFY` under
+`EBPF_PROGRAM_TYPE_FLOW_CLASSIFY`. It does not change the STREAM attach type, lifecycle, or WFP
+behavior described above.
+
+### Datagram requirements
+
+- The attach type covers the traffic delivered by `FWPM_LAYER_DATAGRAM_DATA_V4/V6`, including
+  connected, unconnected, and raw-socket flows.
+- Programs receive NEW, data, and DELETED callbacks for the WFP flow.
+- Each data callback contains one complete, reassembled datagram payload with preserved boundaries.
+- The context contains the current datagram tuple, direction, and stable WFP flow identifier.
+- ALLOW stops callbacks for the returning program while other programs may continue.
+- NEED_MORE_DATA permits the current datagram and continues classification of later datagrams.
+- BLOCK drops the current and subsequent datagrams for the WFP flow until flow deletion or expiry.
+  It does not promise that the underlying socket is closed.
+- Process and application identity are not part of the FLOW_CLASSIFY context.
+
+### Shared context
+
+The shared context is extended with a data-path discriminator and protocol-metadata flags:
+
+```c
+typedef enum _ebpf_flow_classify_data_path
+{
+    EBPF_FLOW_CLASSIFY_DATA_PATH_STREAM,
+    EBPF_FLOW_CLASSIFY_DATA_PATH_DATAGRAM,
+} ebpf_flow_classify_data_path_t;
+
+typedef enum _ebpf_flow_classify_metadata_flag
+{
+    EBPF_FLOW_CLASSIFY_METADATA_PORTS_VALID = 1 << 0,
+    EBPF_FLOW_CLASSIFY_METADATA_ICMP_TYPE_CODE_VALID = 1 << 1,
+} ebpf_flow_classify_metadata_flag_t;
+
+// Fields appended to ebpf_flow_classify_t.
+uint32_t data_path;      ///< ebpf_flow_classify_data_path_t.
+uint32_t metadata_flags; ///< ebpf_flow_classify_metadata_flag_t bitmask.
+```
+
+`data_path` is set to `EBPF_FLOW_CLASSIFY_DATA_PATH_STREAM` or
+`EBPF_FLOW_CLASSIFY_DATA_PATH_DATAGRAM` for every callback. Programs that can attach to both hook
+types must check this field before interpreting `data_start` and `data_end`.
+
+`metadata_flags` defines the interpretation of protocol-dependent fields:
+
+- TCP STREAM and UDP DATAGRAM callbacks set `EBPF_FLOW_CLASSIFY_METADATA_PORTS_VALID`.
+- ICMP and ICMPv6 DATAGRAM callbacks clear the port flag, set
+  `EBPF_FLOW_CLASSIFY_METADATA_ICMP_TYPE_CODE_VALID`, and place type and code in `local_port` and
+  `remote_port`.
+- Raw or unrecognized protocols clear both flags.
+
+For STREAM callbacks, `data_start` and `data_end` contain ordered TCP stream bytes. DATAGRAM
+callbacks use these protocol-specific payload ranges:
+
+- UDP and other recognized port-bearing transports: bytes after the transport header.
+- ICMP and ICMPv6: bytes after the base ICMP header.
+- Raw and unrecognized protocols: bytes after the IP header.
+
+NEW and DELETED callbacks do not contain payload.
+
+### Datagram lifecycle
+
+The DATAGRAM attach provider registers callouts at
+`FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4/V6` and `FWPM_LAYER_DATAGRAM_DATA_V4/V6`.
+
+1. At FLOW_ESTABLISHED, invoke attached DATAGRAM programs with `state` set to
+   `EBPF_FLOW_STATE_NEW`.
+2. ALLOW removes the returning program. NEED_MORE_DATA keeps it active. BLOCK records blocked state.
+3. If at least one program remains active or the flow is blocked, associate the context with the
+   DATAGRAM_DATA callout using `FWP_CALLOUT_FLAG_CONDITIONAL_ON_FLOW`.
+4. For each datagram, populate the tuple and direction from the current datagram and invoke active
+   programs in attachment order.
+5. If no program remains active, disassociate and release the flow context.
+6. If a program returns BLOCK, block the current datagram, invoke DELETED once for programs that
+   were still active, release program state, and retain a minimal blocked-flow marker.
+7. The blocked-flow marker drops later datagrams without invoking eBPF programs and is released at
+   flow deletion or expiry.
+8. A flow-delete callback invokes DELETED once for programs that are still active, then releases
+   the context. Programs already cleaned up after BLOCK are not invoked again.
+
+Public WFP documentation indicates that first inbound and outbound non-TCP packets for a unique
+remote tuple pass through AUTH_RECV_ACCEPT or AUTH_CONNECT and FLOW_ESTABLISHED before
+DATAGRAM_DATA. The implementation must validate connectionless-flow granularity, callback ordering,
+and complete-datagram delivery on every supported Windows release, including wildcard-bound and
+unconnected sockets. Programs that require peer- or transaction-specific state must use the current
+tuple and protocol identifiers in addition to `flow_id` when needed.
+
+### Datagram data handling
+
+At DATAGRAM_DATA, `layerData` is a `NET_BUFFER_LIST`. Inbound and outbound data offsets differ.
+The provider must normalize both directions to the payload ranges defined above and expose a
+contiguous `data_start` to `data_end` range. Non-contiguous data is copied into temporary non-paged
+storage and released after program execution.
+
+The hook contract requires one complete, reassembled datagram per callback. The implementation must
+validate this WFP behavior on every supported release. Partial fragments must not be exposed as
+ordinary DATAGRAM callbacks.
+
+### Validation
+
+- Connected and unconnected UDP over IPv4 and IPv6, inbound and outbound.
+- ICMP, ICMPv6, raw-socket, and other DATAGRAM_DATA traffic.
+- FLOW_ESTABLISHED, DATAGRAM_DATA, and flow-delete ordering for unique remote tuples and
+  wildcard-bound sockets.
+- Inbound and outbound payload normalization and non-contiguous NBL handling.
+- Complete-datagram delivery and fragment handling.
+- Multiple attached programs and ALLOW, NEED_MORE_DATA, BLOCK, and exactly-once DELETED behavior.
+- Persistent BLOCK until flow deletion or expiry.
+- Active-flow, blocked-flow, and temporary-buffer resource limits.
+- Program-info and verifier coverage for the shared context and both attach types.
+
+### Non-goals
+
+- Async PEND/complete. That behavior belongs to the separate
+  [eBPF asynchronous processing proposal](https://github.com/microsoft/ebpf-for-windows/pull/5189).
+- Independent one-datagram filtering semantics.
+- Payload mutation, redirect, or rewriting.
+- Process, application, or security-token identity propagation.
+- Raw IP or transport-header exposure through the primary payload range.
+- IP fragment reassembly in eBPF programs.
+
+### References
+
+- [Filtering layer identifiers](https://learn.microsoft.com/windows/win32/fwp/management-filtering-layer-identifiers-)
+- [ALE layers](https://learn.microsoft.com/windows/win32/fwp/ale-layers)
+- [UDP packet flows](https://learn.microsoft.com/windows/win32/fwp/udp-packet-flows)
